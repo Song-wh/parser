@@ -1,0 +1,344 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>자동 로그 JSON 파서</title>
+    <script src="https://unpkg.com/react@18/umd/react.development.js"></script>
+    <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        .muted-foreground {
+            color: #6b7280;
+        }
+    </style>
+</head>
+<body>
+    <div id="root"></div>
+
+    <script type="text/babel">
+        const { useState } = React;
+
+        function LogJsonParser() {
+          const [rawLogs, setRawLogs] = useState("");
+          const [parsedItems, setParsedItems] = useState([]);
+          const [error, setError] = useState(null);
+          const [selectedIndex, setSelectedIndex] = useState(null);
+
+          // 정규식: 중첩된 JSON 문자열까지 어느 정도 잡아내기 위한 단순 추출기
+          const jsonExtractor = /\{(?:[^{}]|\{[^{}]*\})*\}/g;
+
+          // 유틸: 숫자 문자열인지 확인
+          const isNumericStr = (s) => /^-?\d+(?:\.\d+)?$/.test(s);
+
+          // 유틸: 유닉스 타임스탬프(초)로 보이는 숫자인지 판별 (약 10자리 이상인 경우)
+          const looksLikeUnixTS = (n) => n > 1000000000 && n < 9999999999 * 1000;
+
+          // 중첩된 JSON 문자열(예: "input":"{\"ex\":...}\"") 를 실제 객체로 변환
+          const tryParseNestedJSONStrings = (value) => {
+            if (typeof value === "string") {
+              // 앞뒤에 따옴표로 이스케이프된 JSON이 있는지 시도
+              const trimmed = value.trim();
+              if ((trimmed.startsWith("{") && trimmed.endsWith("}")) || (trimmed.startsWith("[") && trimmed.endsWith("]"))) {
+                try {
+                  const parsed = JSON.parse(trimmed);
+                  return tryParseNestedJSONStrings(parsed);
+                } catch (e) {
+                  // 그대로 문자열로 유지
+                  return value;
+                }
+              }
+              return value;
+            }
+            if (Array.isArray(value)) return value.map(tryParseNestedJSONStrings);
+            if (value && typeof value === "object") {
+              const out = {};
+              for (const k of Object.keys(value)) {
+                out[k] = tryParseNestedJSONStrings(value[k]);
+              }
+              return out;
+            }
+            return value;
+          };
+
+          const parseSingleJsonText = (jsonText) => {
+            try {
+              const obj = JSON.parse(jsonText);
+              return tryParseNestedJSONStrings(obj);
+            } catch (e) {
+              return null;
+            }
+          };
+
+          const autoTypeConvertOutputArray = (arr) => {
+            return arr.map((v) => {
+              // 숫자처럼 보이면 숫자, unix timestamp 가능성 있으면 Date로 변환(표시용)
+              if (typeof v === "string") {
+                if (isNumericStr(v)) {
+                  const n = Number(v);
+                  if (looksLikeUnixTS(n)) {
+                    // 가능성이 큰 경우 Date로 변환
+                    return { raw: v, asNumber: n, asDate: new Date(n * (n > 1e12 ? 1 : 1)), guessed: true };
+                  }
+                  return { raw: v, asNumber: n };
+                }
+                return v;
+              }
+              if (typeof v === "number") {
+                if (looksLikeUnixTS(v)) return { raw: v, asNumber: v, asDate: new Date(v * (v > 1e12 ? 1 : 1)), guessed: true };
+                return v;
+              }
+              return v;
+            });
+          };
+
+          const onParse = () => {
+            setError(null);
+            const found = [];
+            // 여러 줄 로그에서 추출
+            const matches = rawLogs.matchAll(jsonExtractor);
+            for (const m of matches) {
+              const txt = m[0];
+              // 1) 그대로 JSON으로 파싱 시도
+              const parsed = parseSingleJsonText(txt);
+              if (parsed) {
+                // 만약 내부 필드들이 또 문자열 JSON 형태로 들어있다면 파싱
+                // 자동으로 input/output 분리
+                let kind = "unknown";
+                if (parsed.input && Array.isArray(parsed.input)) kind = "request";
+                if (parsed.output && Array.isArray(parsed.output)) kind = "response";
+                // output 타입 힌트 변환
+                if (parsed.output && Array.isArray(parsed.output)) parsed.output = autoTypeConvertOutputArray(parsed.output);
+                found.push({ raw: txt, parsed, kind });
+                continue;
+              }
+
+              // 2) 자주 나오는 케이스: 로그 필드 안에 JSON 문자열이 들어있는 형태
+              // 예: ... "input":"{\"ex\":...}\"" 또는 "data":"{...}" 형식
+              // 로그 안에서 "input":"{...}" 패턴 찾기
+              try {
+                // 더 완화된 패턴으로 내부 JSON 추출 시도
+                const innerJsonMatch = txt.match(/:\\?"(\{(?:[^\\]|\\.)*\})\\?"/);
+                if (innerJsonMatch) {
+                  const inner = innerJsonMatch[1];
+                  const parsedInner = parseSingleJsonText(inner);
+                  if (parsedInner) {
+                    if (parsedInner.output && Array.isArray(parsedInner.output)) parsedInner.output = autoTypeConvertOutputArray(parsedInner.output);
+                    found.push({ raw: txt, parsed: parsedInner, kind: parsedInner.output ? "response" : "request" });
+                    continue;
+                  }
+                }
+              } catch (e) {
+                // 무시
+              }
+
+              // 최종 실패: 원문 저장
+              found.push({ raw: txt, parsed: null, kind: "unknown" });
+            }
+
+            if (found.length === 0) {
+              setError("로그에서 JSON을 찾지 못했습니다.");
+              setParsedItems([]);
+              return;
+            }
+
+            setParsedItems(found);
+            setSelectedIndex(found.length - 1);
+          };
+
+          const clearAll = () => {
+            setRawLogs("");
+            setParsedItems([]);
+            setSelectedIndex(null);
+            setError(null);
+          };
+
+          const downloadJSON = (obj) => {
+            const blob = new Blob([JSON.stringify(obj, null, 2)], { type: "application/json" });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement("a");
+            a.href = url;
+            a.download = `parsed_${new Date().toISOString()}.json`;
+            a.click();
+            URL.revokeObjectURL(url);
+          };
+
+          const renderParsedSummary = (item, idx) => {
+            if (!item) return null;
+            if (!item.parsed) return <div className="p-4">파싱 실패 — 원문만 표시됨</div>;
+
+            const p = item.parsed;
+
+            return (
+              <div className="space-y-3 p-4">
+                <div className="flex items-start justify-between">
+                  <div>
+                    <div className="text-xs text-gray-600">type</div>
+                    <div className="font-medium">{item.kind}</div>
+                  </div>
+                  <div className="flex gap-2">
+                    <button
+                      className="px-3 py-1 rounded bg-sky-600 text-white text-sm"
+                      onClick={() => downloadJSON(p)}
+                    >
+                      JSON 다운로드
+                    </button>
+                    <button
+                      className="px-3 py-1 rounded border text-sm"
+                      onClick={() => navigator.clipboard.writeText(JSON.stringify(p, null, 2))}
+                    >
+                      복사
+                    </button>
+                  </div>
+                </div>
+
+                <div>
+                  <div className="text-xs text-gray-600">요약</div>
+                  <pre className="whitespace-pre-wrap bg-gray-50 p-3 rounded text-sm">{JSON.stringify(p, null, 2)}</pre>
+                </div>
+
+                {p.output && Array.isArray(p.output) && (
+                  <div>
+                    <div className="text-xs text-gray-600">output 배열 (추정 매핑)</div>
+                    <div className="grid grid-cols-12 gap-2 text-sm">
+                      {p.output.map((v, i) => (
+                        <div key={i} className="col-span-6 md:col-span-4 lg:col-span-3 p-2 border rounded">
+                          <div className="text-xs text-neutral-500">index {i}</div>
+                          <div className="mt-1">
+                            {typeof v === "object" && v !== null ? (
+                              <pre className="text-xs">{JSON.stringify(v, null, 2)}</pre>
+                            ) : (
+                              <div className="font-mono">{String(v)}</div>
+                            )}
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+
+                {/* 제안되는 Go struct 생성 버튼 */}
+                <div>
+                  <div className="text-xs text-gray-600">개발자 도움</div>
+                  <div className="flex gap-2 mt-2">
+                    <button
+                      className="px-3 py-1 rounded bg-emerald-600 text-white text-sm"
+                      onClick={() => {
+                        const goStruct = generateGoStruct(p);
+                        navigator.clipboard.writeText(goStruct);
+                        alert("Go struct 코드가 클립보드에 복사되었습니다.");
+                      }}
+                    >
+                      Go Struct 복사
+                    </button>
+                  </div>
+                </div>
+              </div>
+            );
+          };
+
+          const generateGoStruct = (p) => {
+            // 단순 추론 기반 Go struct 생성 (보수적)
+            if (!p || typeof p !== "object") return "";
+            const lines = [];
+            lines.push("type BosResponse struct {");
+            for (const k of Object.keys(p)) {
+              const v = p[k];
+              let t = "string";
+              if (Array.isArray(v)) t = "[]interface{}";
+              else if (typeof v === "number") t = "int64";
+              else if (typeof v === "boolean") t = "bool";
+              else if (typeof v === "object") t = "map[string]interface{}";
+              lines.push(`\t${capitalize(k)} ${t} ` + "`json:\"" + k + "\"`\n");
+            }
+            lines.push("}");
+            return lines.join("\n");
+          };
+
+          const capitalize = (s) => s.charAt(0).toUpperCase() + s.slice(1);
+
+          return (
+            <div className="min-h-screen p-6 bg-gradient-to-br from-white to-gray-50">
+              <div className="max-w-6xl mx-auto">
+                <header className="mb-6">
+                  <h1 className="text-2xl font-bold">자동 로그 JSON 파서</h1>
+                  <p className="text-sm text-neutral-600 mt-1">로그 문자열에서 JSON을 자동으로 추출하고 구조체/매핑을 제안합니다.</p>
+                </header>
+
+                <main className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+                  <section className="lg:col-span-1 bg-white p-4 rounded shadow">
+                    <div className="mb-3 text-sm text-neutral-600">로그 입력 (여러 줄 가능)</div>
+                    <textarea
+                      value={rawLogs}
+                      onChange={(e) => setRawLogs(e.target.value)}
+                      className="w-full h-64 p-3 border rounded resize-none text-sm font-mono"
+                      placeholder={`로그를 붙여넣으세요.\n예: {"level":...}\n또는 gRPC 원문 형태의 req/res 둘 다 지원합니다.`}
+                    ></textarea>
+
+                    <div className="flex gap-2 mt-3">
+                      <button className="px-4 py-2 rounded bg-sky-600 text-white" onClick={onParse}>파싱</button>
+                      <button className="px-4 py-2 rounded border" onClick={clearAll}>초기화</button>
+                      <button
+                        className="px-4 py-2 rounded border"
+                        onClick={() => {
+                          // 샘플 로그 채우기
+                          setRawLogs(prev => prev + `\n{"level":"debug","ts":"2025-11-14T06:34:40.251Z","msg":"TrSendAndRecv","data":"{\\"ex\\":\\"bos\\",\\"rk\\":\\"zosq7619\\",\\"wk\\":\\"\\",\\"gm\\":\\"0010 Your inquiry is complete.\\",\\"mt\\":\\"0\\",\\"output\\":[\\"25252002\\",\\"1.00\\",\\"1.00\\",\\"test\\",\\"USD\\",\\"USD\\",\\"1.00000000000000000000\\",\\"1\\",\\"1.00000000000000000000\\",1757390520,1759377600,\\"5\\",\\"0\\",\\"3\\",\\"0.00000000000000000000\\",\\"1312867844195\\"]}"}`);
+                        }}
+                      >샘플 추가</button>
+                    </div>
+
+                    {error && <div className="mt-3 text-sm text-red-600">{error}</div>}
+                  </section>
+
+                  <section className="lg:col-span-2 bg-white p-4 rounded shadow">
+                    <div className="flex items-center justify-between mb-3">
+                      <div>
+                        <div className="text-xs text-neutral-500">파싱 결과</div>
+                        <div className="text-lg font-medium">{parsedItems.length}개 항목</div>
+                      </div>
+                      <div>
+                        <button className="px-3 py-1 rounded border text-sm" onClick={() => navigator.clipboard.writeText(JSON.stringify(parsedItems, null, 2))}>전체 복사</button>
+                      </div>
+                    </div>
+
+                    <div className="grid grid-cols-4 gap-4">
+                      <div className="col-span-1">
+                        <div className="space-y-2">
+                          {parsedItems.length === 0 && <div className="text-sm text-neutral-500">아직 파싱된 항목이 없습니다.</div>}
+                          {parsedItems.map((it, i) => (
+                            <button
+                              key={i}
+                              onClick={() => setSelectedIndex(i)}
+                              className={`w-full text-left p-2 rounded border ${selectedIndex === i ? "bg-sky-50 border-sky-300" : "bg-white"}`}
+                            >
+                              <div className="text-xs text-neutral-500">#{i}</div>
+                              <div className="text-sm font-medium truncate">{it.parsed && it.parsed.gm ? it.parsed.gm : it.kind}</div>
+                              <div className="text-xs text-neutral-400">{it.parsed && it.parsed.rk ? it.parsed.rk : "-"}</div>
+                            </button>
+                          ))}
+                        </div>
+                      </div>
+
+                      <div className="col-span-3">
+                        {selectedIndex === null && <div className="text-sm text-neutral-500 p-4">왼쪽 항목을 선택하세요.</div>}
+                        {selectedIndex !== null && renderParsedSummary(parsedItems[selectedIndex], selectedIndex)}
+                      </div>
+                    </div>
+                  </section>
+                </main>
+
+                <footer className="mt-6 text-sm text-neutral-500">
+                  <div>제작: 자동 로그 JSON 파서 • 필요한 기능(Go 코드 출력, CSV 다운로드, 서버 연동 등) 추가 가능합니다.</div>
+                </footer>
+              </div>
+            </div>
+          );
+        }
+
+        const root = ReactDOM.createRoot(document.getElementById('root'));
+        root.render(<LogJsonParser />);
+    </script>
+</body>
+</html>
+
