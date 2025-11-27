@@ -26,14 +26,129 @@
           const [error, setError] = useState(null);
           const [selectedIndex, setSelectedIndex] = useState(null);
 
-          // 정규식: 중첩된 JSON 문자열까지 어느 정도 잡아내기 위한 단순 추출기
-          const jsonExtractor = /\{(?:[^{}]|\{[^{}]*\})*\}/g;
+          // 정규식보다 강력한 JSON 추출기 - 중괄호 깊이 추적
+          const extractJSONs = (text) => {
+            const results = [];
+            let i = 0;
+            
+            while (i < text.length) {
+              // { 찾기
+              if (text[i] === '{') {
+                const start = i;
+                let depth = 0;
+                let inString = false;
+                let escapeNext = false;
+                
+                while (i < text.length) {
+                  const char = text[i];
+                  
+                  if (escapeNext) {
+                    escapeNext = false;
+                    i++;
+                    continue;
+                  }
+                  
+                  if (char === '\\') {
+                    escapeNext = true;
+                    i++;
+                    continue;
+                  }
+                  
+                  if (char === '"') {
+                    inString = !inString;
+                  } else if (!inString) {
+                    if (char === '{') depth++;
+                    else if (char === '}') {
+                      depth--;
+                      if (depth === 0) {
+                        // JSON 완성
+                        results.push(text.substring(start, i + 1));
+                        break;
+                      }
+                    }
+                  }
+                  
+                  i++;
+                }
+              }
+              i++;
+            }
+            
+            return results;
+          };
 
           // 유틸: 숫자 문자열인지 확인
           const isNumericStr = (s) => /^-?\d+(?:\.\d+)?$/.test(s);
 
           // 유틸: 유닉스 타임스탬프(초)로 보이는 숫자인지 판별 (약 10자리 이상인 경우)
           const looksLikeUnixTS = (n) => n > 1000000000 && n < 9999999999 * 1000;
+
+          // Protobuf text format을 JSON으로 변환
+          const parseProtobufText = (text) => {
+            try {
+              const result = {};
+              let pos = 0;
+              
+              const skipWhitespace = () => {
+                while (pos < text.length && /\s/.test(text[pos])) pos++;
+              };
+              
+              const readKey = () => {
+                skipWhitespace();
+                const match = text.slice(pos).match(/^(\w+):/);
+                if (!match) return null;
+                pos += match[0].length;
+                return match[1];
+              };
+              
+              const readValue = () => {
+                skipWhitespace();
+                // String value: "..."
+                if (text[pos] === '"') {
+                  pos++;
+                  let str = '';
+                  while (pos < text.length && text[pos] !== '"') {
+                    if (text[pos] === '\\') pos++;
+                    str += text[pos++];
+                  }
+                  pos++; // skip closing "
+                  return str;
+                }
+                // Object value: {...}
+                if (text[pos] === '{') {
+                  pos++;
+                  let depth = 1;
+                  let objText = '';
+                  while (pos < text.length && depth > 0) {
+                    if (text[pos] === '{') depth++;
+                    if (text[pos] === '}') depth--;
+                    if (depth > 0) objText += text[pos];
+                    pos++;
+                  }
+                  return parseProtobufText(objText);
+                }
+                // Number or identifier
+                const match = text.slice(pos).match(/^[^\s,}]+/);
+                if (match) {
+                  pos += match[0].length;
+                  return match[0];
+                }
+                return null;
+              };
+              
+              while (pos < text.length) {
+                const key = readKey();
+                if (!key) break;
+                const value = readValue();
+                if (value !== null) result[key] = value;
+                skipWhitespace();
+              }
+              
+              return Object.keys(result).length > 0 ? result : null;
+            } catch (e) {
+              return null;
+            }
+          };
 
           // 중첩된 JSON 문자열(예: "input":"{\"ex\":...}\"") 를 실제 객체로 변환
           const tryParseNestedJSONStrings = (value) => {
@@ -64,9 +179,25 @@
 
           const parseSingleJsonText = (jsonText) => {
             try {
-              const obj = JSON.parse(jsonText);
-              return tryParseNestedJSONStrings(obj);
+              // JSON 내부의 줄바꿈 제거 (문자열 값 내부 제외)
+              const cleanedText = jsonText.replace(/\n(?=\s*[,:\}\]])/g, '').replace(/\n\s*/g, ' ');
+              const obj = JSON.parse(cleanedText);
+              
+              // req 필드는 Protobuf이므로 tryParseNestedJSONStrings를 건너뜀
+              const result = {};
+              for (const key in obj) {
+                if (key === 'req' || key === 'data') {
+                  // req/data 필드는 나중에 Protobuf로 파싱
+                  result[key] = obj[key];
+                } else {
+                  result[key] = tryParseNestedJSONStrings(obj[key]);
+                }
+              }
+              
+              return result;
             } catch (e) {
+              // JSON 파싱 실패는 조용히 무시 (정규식이 부분 문자열을 추출할 수 있음)
+              console.log('  -> JSON parse failed:', e.message);
               return null;
             }
           };
@@ -96,22 +227,85 @@
           const onParse = () => {
             setError(null);
             const found = [];
+            const seen = new Set(); // 중복 방지
+            
             // 여러 줄 로그에서 추출
-            const matches = rawLogs.matchAll(jsonExtractor);
-            for (const m of matches) {
-              const txt = m[0];
+            const matches = extractJSONs(rawLogs);
+            console.log(`Found ${matches.length} JSON objects`);
+            
+            matches.forEach((txt, matchIndex) => {
+              console.log(`Match ${matchIndex + 1}:`, txt.substring(0, 80) + '...');
+              
+              // 이미 처리한 텍스트의 부분 문자열이면 건너뛰기
+              let isSubstring = false;
+              for (const seenTxt of seen) {
+                if (seenTxt.includes(txt) && seenTxt !== txt) {
+                  isSubstring = true;
+                  console.log(`  -> Skipped (substring of previous match)`);
+                  break;
+                }
+              }
+              if (isSubstring) return;
+              
               // 1) 그대로 JSON으로 파싱 시도
               const parsed = parseSingleJsonText(txt);
+              console.log('  -> Parsed result:', parsed ? '✅ Success' : '❌ Failed');
               if (parsed) {
+                // Protobuf text format이 있는지 확인 (req, data 필드)
+                if (parsed.req && typeof parsed.req === 'string') {
+                  const protoParsed = parseProtobufText(parsed.req);
+                  if (protoParsed) {
+                    parsed.req = protoParsed;
+                  }
+                }
+                if (parsed.data && typeof parsed.data === 'string') {
+                  const protoParsed = parseProtobufText(parsed.data);
+                  if (protoParsed) {
+                    parsed.data = protoParsed;
+                  }
+                }
+                
                 // 만약 내부 필드들이 또 문자열 JSON 형태로 들어있다면 파싱
                 // 자동으로 input/output 분리
                 let kind = "unknown";
-                if (parsed.input && Array.isArray(parsed.input)) kind = "request";
-                if (parsed.output && Array.isArray(parsed.output)) kind = "response";
-                // output 타입 힌트 변환
-                if (parsed.output && Array.isArray(parsed.output)) parsed.output = autoTypeConvertOutputArray(parsed.output);
+                
+                // input이 있으면 request
+                if (parsed.input) {
+                  kind = "request";
+                  if (Array.isArray(parsed.input)) {
+                    // 이미 배열이면 그대로
+                  } else if (typeof parsed.input === 'object' && parsed.input.input) {
+                    // input 안에 input이 있으면 중첩 구조 평탄화
+                    parsed.input = parsed.input.input;
+                  }
+                }
+                // req가 있으면 request
+                else if (parsed.req) {
+                  kind = "request";
+                  // req 안의 input을 최상위로
+                  if (parsed.req.input) {
+                    parsed.input = parsed.req.input;
+                    // list_value 구조 평탄화
+                    if (parsed.input && parsed.input.list_value && parsed.input.list_value.values) {
+                      const values = parsed.input.list_value.values;
+                      if (values.string_value !== undefined) {
+                        parsed.input = [values.string_value];
+                      }
+                    }
+                  }
+                }
+                // output이 있으면 response
+                else if (parsed.output) {
+                  kind = "response";
+                  if (Array.isArray(parsed.output)) {
+                    parsed.output = autoTypeConvertOutputArray(parsed.output);
+                  }
+                }
+                
+                console.log('✅ Parsed:', parsed.msg || 'unknown', '| kind:', kind);
+                seen.add(txt); // 성공한 파싱 기록
                 found.push({ raw: txt, parsed, kind });
-                continue;
+                return;
               }
 
               // 2) 자주 나오는 케이스: 로그 필드 안에 JSON 문자열이 들어있는 형태
@@ -126,7 +320,7 @@
                   if (parsedInner) {
                     if (parsedInner.output && Array.isArray(parsedInner.output)) parsedInner.output = autoTypeConvertOutputArray(parsedInner.output);
                     found.push({ raw: txt, parsed: parsedInner, kind: parsedInner.output ? "response" : "request" });
-                    continue;
+                    return;
                   }
                 }
               } catch (e) {
@@ -135,7 +329,7 @@
 
               // 최종 실패: 원문 저장
               found.push({ raw: txt, parsed: null, kind: "unknown" });
-            }
+            });
 
             if (found.length === 0) {
               setError("로그에서 JSON을 찾지 못했습니다.");
@@ -165,10 +359,15 @@
           };
 
           const renderParsedSummary = (item, idx) => {
+            console.log('renderParsedSummary called with:', item);
             if (!item) return null;
-            if (!item.parsed) return <div className="p-4">파싱 실패 — 원문만 표시됨</div>;
+            if (!item.parsed) {
+              console.log('  -> No parsed data, showing error');
+              return <div className="p-4">파싱 실패 — 원문만 표시됨</div>;
+            }
 
             const p = item.parsed;
+            console.log('  -> Rendering parsed data:', p);
 
             return (
               <div className="space-y-3 p-4">
@@ -197,6 +396,26 @@
                   <div className="text-xs text-gray-600">요약</div>
                   <pre className="whitespace-pre-wrap bg-gray-50 p-3 rounded text-sm">{JSON.stringify(p, null, 2)}</pre>
                 </div>
+
+                {p.input && Array.isArray(p.input) && (
+                  <div>
+                    <div className="text-xs text-gray-600">input 배열</div>
+                    <div className="grid grid-cols-12 gap-2 text-sm">
+                      {p.input.map((v, i) => (
+                        <div key={i} className="col-span-6 md:col-span-4 lg:col-span-3 p-2 border rounded bg-blue-50">
+                          <div className="text-xs text-neutral-500">index {i}</div>
+                          <div className="mt-1">
+                            {typeof v === "object" && v !== null ? (
+                              <pre className="text-xs">{JSON.stringify(v, null, 2)}</pre>
+                            ) : (
+                              <div className="font-mono">{String(v)}</div>
+                            )}
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
 
                 {p.output && Array.isArray(p.output) && (
                   <div>
@@ -313,8 +532,15 @@
                               className={`w-full text-left p-2 rounded border ${selectedIndex === i ? "bg-sky-50 border-sky-300" : "bg-white"}`}
                             >
                               <div className="text-xs text-neutral-500">#{i}</div>
-                              <div className="text-sm font-medium truncate">{it.parsed && it.parsed.gm ? it.parsed.gm : it.kind}</div>
-                              <div className="text-xs text-neutral-400">{it.parsed && it.parsed.rk ? it.parsed.rk : "-"}</div>
+                              <div className="text-sm font-medium truncate">
+                                {it.parsed && it.parsed.gm ? it.parsed.gm : 
+                                 it.parsed && it.parsed.msg ? it.parsed.msg : 
+                                 it.kind}
+                              </div>
+                              <div className="text-xs text-neutral-400">
+                                {it.parsed && it.parsed.rk ? it.parsed.rk : 
+                                 it.parsed && it.parsed.ex ? it.parsed.ex : "-"}
+                              </div>
                             </button>
                           ))}
                         </div>
