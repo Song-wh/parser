@@ -26,15 +26,17 @@
           const [error, setError] = useState(null);
           const [selectedIndex, setSelectedIndex] = useState(null);
 
-          // 정규식보다 강력한 JSON 추출기 - 중괄호 깊이 추적
+          // 정규식보다 강력한 JSON 추출기 - 중괄호 및 대괄호 깊이 추적
           const extractJSONs = (text) => {
             const results = [];
             let i = 0;
             
             while (i < text.length) {
-              // { 찾기
-              if (text[i] === '{') {
+              // { 또는 [ 찾기
+              if (text[i] === '{' || text[i] === '[') {
                 const start = i;
+                const openChar = text[i];
+                const closeChar = openChar === '{' ? '}' : ']';
                 let depth = 0;
                 let inString = false;
                 let escapeNext = false;
@@ -57,8 +59,8 @@
                   if (char === '"') {
                     inString = !inString;
                   } else if (!inString) {
-                    if (char === '{') depth++;
-                    else if (char === '}') {
+                    if (char === openChar) depth++;
+                    else if (char === closeChar) {
                       depth--;
                       if (depth === 0) {
                         // JSON 완성
@@ -180,7 +182,10 @@
           const parseSingleJsonText = (jsonText) => {
             try {
               // JSON 내부의 줄바꿈 제거 (문자열 값 내부 제외)
-              const cleanedText = jsonText.replace(/\n(?=\s*[,:\}\]])/g, '').replace(/\n\s*/g, ' ');
+              let cleanedText = jsonText.trim();
+              
+              // 혹시 이스케이프가 남아있으면 제거
+              // 단, 이미 올바른 JSON일 수도 있으니 조심스럽게
               const obj = JSON.parse(cleanedText);
               
               // req 필드는 Protobuf이므로 tryParseNestedJSONStrings를 건너뜀
@@ -229,9 +234,30 @@
             const found = [];
             const seen = new Set(); // 중복 방지
             
+            // 먼저 구조화된 로그 형식 (logrus/logfmt) 에서 msg 필드 추출 시도
+            let textToParse = rawLogs;
+            
+            // logfmt 형식에서 msg 필드 추출 (이스케이프된 문자열 포함)
+            const logfmtMatch = rawLogs.match(/msg="((?:[^"\\]|\\.)*)"/);
+            if (logfmtMatch) {
+              let msgContent = logfmtMatch[1];
+              console.log('Found msg field:', msgContent.substring(0, 100) + '...');
+              
+              // "Body: " 이후의 내용 추출
+              const bodyMatch = msgContent.match(/Body:\s*(.+)$/);
+              if (bodyMatch) {
+                // 이스케이프된 따옴표를 실제 따옴표로 변환
+                textToParse = bodyMatch[1].replace(/\\"/g, '"').replace(/\\\\/g, '\\');
+                console.log('Extracted and unescaped from Body:', textToParse.substring(0, 100) + '...');
+              } else {
+                // Body가 없으면 msg 전체 사용
+                textToParse = msgContent.replace(/\\"/g, '"').replace(/\\\\/g, '\\');
+              }
+            }
+            
             // 여러 줄 로그에서 추출
-            const matches = extractJSONs(rawLogs);
-            console.log(`Found ${matches.length} JSON objects`);
+            const matches = extractJSONs(textToParse);
+            console.log(`Found ${matches.length} JSON objects/arrays`);
             
             matches.forEach((txt, matchIndex) => {
               console.log(`Match ${matchIndex + 1}:`, txt.substring(0, 80) + '...');
@@ -251,6 +277,40 @@
               const parsed = parseSingleJsonText(txt);
               console.log('  -> Parsed result:', parsed ? '✅ Success' : '❌ Failed');
               if (parsed) {
+                // 배열인 경우 각 요소를 개별 항목으로 처리
+                if (Array.isArray(parsed)) {
+                  console.log('✅ Parsed array with', parsed.length, 'items');
+                  parsed.forEach((item, idx) => {
+                    // Protobuf text format이 있는지 확인 (req, data 필드)
+                    if (item.req && typeof item.req === 'string') {
+                      const protoParsed = parseProtobufText(item.req);
+                      if (protoParsed) {
+                        item.req = protoParsed;
+                      }
+                    }
+                    if (item.data && typeof item.data === 'string') {
+                      const protoParsed = parseProtobufText(item.data);
+                      if (protoParsed) {
+                        item.data = protoParsed;
+                      }
+                    }
+                    
+                    // 자동으로 kind 결정
+                    let kind = "unknown";
+                    if (item.evtype || item.uid || item.acc) {
+                      kind = "userlog";
+                    } else if (item.input || item.req) {
+                      kind = "request";
+                    } else if (item.output) {
+                      kind = "response";
+                    }
+                    
+                    found.push({ raw: txt, parsed: item, kind, arrayIndex: idx });
+                  });
+                  seen.add(txt);
+                  return;
+                }
+                
                 // Protobuf text format이 있는지 확인 (req, data 필드)
                 if (parsed.req && typeof parsed.req === 'string') {
                   const protoParsed = parseProtobufText(parsed.req);
@@ -531,15 +591,20 @@
                               onClick={() => setSelectedIndex(i)}
                               className={`w-full text-left p-2 rounded border ${selectedIndex === i ? "bg-sky-50 border-sky-300" : "bg-white"}`}
                             >
-                              <div className="text-xs text-neutral-500">#{i}</div>
+                              <div className="text-xs text-neutral-500">
+                                #{i} 
+                                {it.arrayIndex !== undefined && ` [${it.arrayIndex}]`}
+                              </div>
                               <div className="text-sm font-medium truncate">
                                 {it.parsed && it.parsed.gm ? it.parsed.gm : 
                                  it.parsed && it.parsed.msg ? it.parsed.msg : 
+                                 it.parsed && it.parsed.uid ? it.parsed.uid :
                                  it.kind}
                               </div>
                               <div className="text-xs text-neutral-400">
                                 {it.parsed && it.parsed.rk ? it.parsed.rk : 
-                                 it.parsed && it.parsed.ex ? it.parsed.ex : "-"}
+                                 it.parsed && it.parsed.ex ? it.parsed.ex : 
+                                 it.parsed && it.parsed.evtype ? it.parsed.evtype : "-"}
                               </div>
                             </button>
                           ))}
