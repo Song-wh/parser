@@ -1,0 +1,52 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>로그 파싱 테스트</title>
+</head>
+<body>
+    <h1>로그 파싱 테스트</h1>
+    <pre id="output"></pre>
+    
+    <script>
+        // 제공된 실제 로그
+        const rawLog = `time="2025-11-26T09:32:12Z" level="info" msg="[REQUEST /userlog] Body: [{\\"svc\\":\\"1\\",\\"lgsrc\\":\\"pc\\",\\"os\\":\\"windows\\",\\"udate\\":\\"2025-11-26T09:32:09.729Z\\",\\"ltz\\":\\"+09:00\\",\\"uid\\":\\"cgan@mysoftwiz.com\\",\\"uname\\":\\"\\",\\"lid\\":\\"cgan@mysoftwiz.com\\",\\"acc\\":\\"1312167390294\\",\\"evtype\\":\\"click\\",\\"evmsg\\":[{\\"m\\":\\"order number\\",\\"v\\":\\"202511260100000572\\"}],\\"cocd\\":\\"01\\"}]"`;
+        
+        const output = document.getElementById('output');
+        
+        try {
+            output.textContent = '1. 원본 로그:\n' + rawLog + '\n\n';
+            
+            // msg 필드 추출
+            const msgMatch = rawLog.match(/msg="((?:[^"\\]|\\.)*)"/);
+            if (msgMatch) {
+                output.textContent += '2. msg 필드 추출:\n' + msgMatch[1] + '\n\n';
+                
+                let msgContent = msgMatch[1];
+                
+                // Body 이후 추출
+                const bodyMatch = msgContent.match(/Body:\s*(.+)$/);
+                if (bodyMatch) {
+                    output.textContent += '3. Body 이후 추출:\n' + bodyMatch[1] + '\n\n';
+                    
+                    // 이스케이프 해제
+                    const unescaped = bodyMatch[1].replace(/\\"/g, '"').replace(/\\\\/g, '\\');
+                    output.textContent += '4. 이스케이프 해제:\n' + unescaped + '\n\n';
+                    
+                    // JSON 파싱
+                    const parsed = JSON.parse(unescaped);
+                    output.textContent += '5. 파싱 성공! 항목 개수: ' + parsed.length + '\n\n';
+                    output.textContent += '6. 파싱 결과:\n' + JSON.stringify(parsed, null, 2);
+                }
+            }
+        } catch (e) {
+            output.textContent += '\n\n❌ 에러: ' + e.message + '\n' + e.stack;
+        }
+    </script>
+</body>
+</html>
+
+
+
+
+
